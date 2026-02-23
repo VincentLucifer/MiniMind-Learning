@@ -19,54 +19,100 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 
 warnings.filterwarnings('ignore')
 
-
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
+    # start=start_step+1：续训时 step 编号连续（日志/学习率计算更“接近连续”）
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+
+        # ===== 1) 数据搬到设备（GPU/CPU）=====
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
+
+        # ===== 2) 动态学习率：按“全局 step”更新 lr =====
+        # global_step = epoch * iters + step（把 epoch 内 step 映射到全局训练进度）
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        with autocast_ctx:
-            res = model(input_ids, labels=labels)
-            loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
+        # ===== 3) 前向 + 计算 loss（AMP 混合精度）=====
+        with autocast_ctx:  # GPU 时启用 autocast（bf16/fp16），CPU 时是空上下文
+            res = model(input_ids, labels=labels)   # 模型前向（返回 loss/aux_loss 等）
+            loss = res.loss + res.aux_loss          # 主 loss + 辅助 loss（如 MoE）
+            loss = loss / args.accumulation_steps   # 梯度累积：把每个 micro-batch loss 缩小
 
+        # ===== 4) 反向传播（GradScaler：主要用于 fp16 防止下溢）=====
         scaler.scale(loss).backward()
 
+        # ===== 5) 梯度累积到指定步数后，才真正更新参数 =====
         if (step + 1) % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.unscale_(optimizer)  # 先 unscale，再做梯度裁剪才有意义
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # 防梯度爆炸
 
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.step(optimizer)  # 等价于 optimizer.step()（带 overflow 检查）
+            scaler.update()         # 更新缩放因子
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)  # 清梯度（set_to_none 更省显存/更快）
 
+        # ===== 6) 日志输出（loss/lr/ETA）=====
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
+
+            # 注意：loss 前面除过 accumulation_steps，这里乘回来用于展示“真实 loss”
             current_loss = loss.item() * args.accumulation_steps
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
+            # ETA：按当前平均 step 耗时估计 epoch 剩余时间（分钟）
+            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+
+            Logger(
+                f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), '
+                f'loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, '
+                f'aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, '
+                f'epoch_time: {eta_min:.1f}min'
+            )
+            if wandb:
+                wandb.log({
+                    "loss": current_loss,
+                    "logits_loss": current_logits_loss,
+                    "aux_loss": current_aux_loss,
+                    "learning_rate": current_lr,
+                    "epoch_time": eta_min
+                })
+
+        # ===== 7) 保存 checkpoint（仅主进程保存，避免 DDP 多份写冲突）=====
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
-            model.eval()
+            model.eval()  # 保存前切 eval（避免某些层状态变化；保存后会切回 train）
+
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+
+            # DDP 下真正的模型在 model.module；compile 模型可能在 _orig_mod
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
+
             state_dict = raw_model.state_dict()
+            # 保存半精度权重到 CPU（文件更小，但保存时会有一次 CPU 拷贝开销）
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+
+            # 额外保存完整训练状态（模型/优化器/scaler/epoch/step/wandb_id）
+            lm_checkpoint(
+                lm_config,
+                weight=args.save_weight,
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch,
+                step=step,
+                wandb=wandb,
+                save_dir='../checkpoints'
+            )
+
             model.train()
             del state_dict
 
+        # ===== 8) 显式释放局部变量（减少显存峰值/加快回收）=====
         del input_ids, labels, res, loss
 
 
